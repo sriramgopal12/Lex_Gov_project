@@ -1,6 +1,6 @@
-import os
+from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, UploadFile, status
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
 from dotenv import load_dotenv
 from pydantic import BaseModel, EmailStr
 
@@ -8,6 +8,12 @@ from general_logic.auth import (
 	initialize_database,
 	login_user,
 	signup_user,
+)
+from general_logic.documents import (
+	build_document_filenames,
+	initialize_document_storage,
+	list_documents_for_user,
+	store_document,
 )
 from parser import parse_document_to_json
 
@@ -30,6 +36,7 @@ class LoginRequest(BaseModel):
 @app.on_event("startup")
 def startup() -> None:
 	initialize_database()
+	initialize_document_storage()
 
 
 @app.get("/")
@@ -69,24 +76,53 @@ def login(payload: LoginRequest) -> dict[str, str]:
 
 
 @app.post("/parse-document")
-def parse_document(file: UploadFile = File(...)) -> dict[str, object]:
+def parse_document(user_id: int = Form(...), file: UploadFile = File(...)) -> dict[str, object]:
+	if user_id <= 0:
+		raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Please provide a valid user_id")
+
 	if not file.filename or not file.filename.lower().endswith(".pdf"):
 		raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Please upload a PDF file")
 
-	temp_path = None
+	original_filename = Path(file.filename).name
+	document_key, pdf_filename, json_filename = build_document_filenames(original_filename)
+	pdf_storage_path = Path("pdf_storage") / pdf_filename
+	json_storage_path = Path("json_storage") / json_filename
 	try:
-		temp_path = f"pdf_storage/{file.filename}"
-		with open(temp_path, "wb") as handle:
-			handle.write(file.file.read())
+		pdf_storage_path.parent.mkdir(parents=True, exist_ok=True)
+		json_storage_path.parent.mkdir(parents=True, exist_ok=True)
 
-		result = parse_document_to_json(temp_path)
+		pdf_bytes = file.file.read()
+		with open(pdf_storage_path, "wb") as handle:
+			handle.write(pdf_bytes)
+
+		parse_document_to_json(pdf_storage_path, json_storage_path)
+		store_document(
+			user_id=user_id,
+			original_filename=original_filename,
+			document_key=document_key,
+			pdf_filename=pdf_filename,
+			json_filename=json_filename,
+		)
+
 		return {
 			"message": "Document parsed successfully",
-			"document": result,
 		}
 	except Exception as exc:  # pragma: no cover - defensive handling
+		if pdf_storage_path.exists():
+			pdf_storage_path.unlink()
+		if json_storage_path.exists():
+			json_storage_path.unlink()
 		raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
-	finally:
-		if temp_path and os.path.exists(temp_path):
-			os.remove(temp_path)
+
+
+@app.get("/documents/{user_id}")
+def list_user_documents(user_id: int) -> dict[str, object]:
+	if user_id <= 0:
+		raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Please provide a valid user_id")
+
+	documents = list_documents_for_user(user_id)
+	return {
+		"message": "Documents retrieved successfully",
+		"documents": documents,
+	}
 
