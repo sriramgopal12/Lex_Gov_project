@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
+from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from pydantic import BaseModel, EmailStr
 
@@ -21,6 +22,13 @@ from parser import parse_document_to_json
 load_dotenv()
 
 app = FastAPI(title="Lex Gov API")
+
+app.add_middleware(
+	CORSMiddleware,
+	allow_origins=["*"],
+	allow_methods=["*"],
+	allow_headers=["*"],
+)
 
 
 class SignupRequest(BaseModel):
@@ -84,7 +92,7 @@ def parse_document(user_id: int = Form(...), file: UploadFile = File(...)) -> di
 		raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Please upload a PDF file")
 
 	original_filename = Path(file.filename).name
-	document_key, pdf_filename, json_filename = build_document_filenames(original_filename)
+	unique_identifier_name, pdf_filename, json_filename = build_document_filenames(original_filename)
 	pdf_storage_path = Path("pdf_storage") / pdf_filename
 	json_storage_path = Path("json_storage") / json_filename
 	try:
@@ -98,8 +106,10 @@ def parse_document(user_id: int = Form(...), file: UploadFile = File(...)) -> di
 		parse_document_to_json(pdf_storage_path, json_storage_path)
 		store_document(
 			user_id=user_id,
+			pdf_name=original_filename,
+			unique_identifier_name=unique_identifier_name,
 			original_filename=original_filename,
-			document_key=document_key,
+			document_key=unique_identifier_name,
 			pdf_filename=pdf_filename,
 			json_filename=json_filename,
 		)
