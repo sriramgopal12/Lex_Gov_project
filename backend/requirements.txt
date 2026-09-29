@@ -4,3 +4,4 @@ psycopg[binary]
 bcrypt<5
 pydantic
 email-validator
+PyJWT

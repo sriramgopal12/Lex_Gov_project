@@ -1,7 +1,20 @@
 import json
 from pathlib import Path
 
-from parser.parser import build_standard_json
+from parser.parser import _parse_sections, build_standard_json
+
+
+def test_parse_sections_does_not_split_on_inline_section_references() -> None:
+    text = """
+7. Disposal of request.—A request under section 6 shall be answered within
+the period specified in sub-section (1) of section 7.
+8. Exemption from disclosure.—Information may be withheld.
+"""
+
+    sections = _parse_sections(text)
+
+    assert [section["section_number"] for section in sections] == ["7", "8"]
+    assert "section 6" in f'{sections[0]["title"]} {sections[0]["content"]}'
 
 
 def test_build_standard_json_structure() -> None:

@@ -1,5 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { fetchDocuments, login, signup, uploadDocument } from './api';
+import {
+  askDocumentQuestion,
+  fetchDocumentPdf,
+  fetchDocuments,
+  fetchSuggestedQuestions,
+  login,
+  simplifyDocumentAnswer,
+  signup,
+  uploadDocument,
+} from './api';
 
 const initialAuth = {
   name: '',
@@ -12,6 +21,7 @@ const ROUTES = {
   signup: '/signup',
   login: '/login',
   dashboard: '/dashboard',
+  documentReview: '/document-review',
 };
 
 function App() {
@@ -27,7 +37,8 @@ function App() {
 
     return window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
   });
-  const [view, setView] = useState(() => getViewFromHash(window.location.hash));
+  const [view, setView] = useState(() => getViewFromLocation());
+  const [currentDocument, setCurrentDocument] = useState(null);
 
   useEffect(() => {
     if (session) {
@@ -44,14 +55,16 @@ function App() {
 
   useEffect(() => {
     function handleHashChange() {
-      setView(getViewFromHash(window.location.hash));
+      setView(getViewFromLocation());
     }
 
     window.addEventListener('hashchange', handleHashChange);
+    window.addEventListener('popstate', handleHashChange);
     handleHashChange();
 
     return () => {
       window.removeEventListener('hashchange', handleHashChange);
+      window.removeEventListener('popstate', handleHashChange);
     };
   }, []);
 
@@ -61,9 +74,36 @@ function App() {
     }
   }, [session, view]);
 
+  useEffect(() => {
+    if (!session || view !== 'document-review' || currentDocument) {
+      return;
+    }
+
+    const documentId = getDocumentIdFromLocation();
+    if (!documentId) {
+      return;
+    }
+
+    fetchDocuments()
+      .then((response) => {
+        const document = response.documents?.find((item) => item.id === documentId);
+        if (document) {
+          setCurrentDocument(document);
+        } else {
+          setHashRoute('dashboard');
+        }
+      })
+      .catch(() => setHashRoute('dashboard'));
+  }, [currentDocument, session, view]);
+
   const resolvedView = session || view !== 'dashboard' ? view : 'dashboard';
 
   function handleNavigate(nextView) {
+    if (nextView === 'document-review') {
+      setHashRoute('documentReview');
+      return;
+    }
+
     setHashRoute(nextView);
   }
 
@@ -81,9 +121,29 @@ function App() {
           session={session}
           onLogout={() => {
             setSession(null);
+            setCurrentDocument(null);
             handleNavigate('landing');
           }}
           onNavigate={handleNavigate}
+          onOpenDocument={(document) => {
+            setCurrentDocument(document);
+            window.history.pushState({}, '', `/documents/${document.id}/chat`);
+            setView('document-review');
+          }}
+        />
+      ) : resolvedView === 'document-review' && currentDocument ? (
+        <DocumentReviewPage
+          session={session}
+          selectedDocument={currentDocument}
+          onBack={() => {
+            setCurrentDocument(null);
+            handleNavigate('dashboard');
+          }}
+          onLogout={() => {
+            setSession(null);
+            setCurrentDocument(null);
+            handleNavigate('landing');
+          }}
         />
       ) : resolvedView === 'signup' ? (
         <AuthPage
@@ -128,11 +188,31 @@ function getViewFromHash(hash) {
     return 'dashboard';
   }
 
+  if (normalized === '/document-review' || /^\/documents\/\d+\/chat$/.test(normalized)) {
+    return 'document-review';
+  }
+
   return 'landing';
+}
+
+function getViewFromLocation() {
+  if (/^\/documents\/\d+\/chat$/.test(window.location.pathname)) {
+    return 'document-review';
+  }
+
+  return getViewFromHash(window.location.hash);
+}
+
+function getDocumentIdFromLocation() {
+  const match = window.location.pathname.match(/^\/documents\/(\d+)\/chat$/);
+  return match ? Number(match[1]) : null;
 }
 
 function setHashRoute(nextView) {
   const nextPath = ROUTES[nextView] || ROUTES.landing;
+  if (window.location.pathname !== '/') {
+    window.history.pushState({}, '', '/');
+  }
   window.location.hash = `#${nextPath}`;
 }
 
@@ -206,27 +286,20 @@ function LandingPage({ session, onLogout, onNavigate }) {
             <span className="panel-chip">Trusted legal portal</span>
           </div>
           <div className="panel-list">
-            <div className="panel-item">
+            <button className="panel-item panel-action" type="button" onClick={() => onNavigate('signup')}>
               <span>01</span>
               <div>
                 <strong>Sign up</strong>
                 <p>Register a profile in seconds.</p>
               </div>
-            </div>
-            <div className="panel-item">
+            </button>
+            <button className="panel-item panel-action" type="button" onClick={() => onNavigate('login')}>
               <span>02</span>
               <div>
                 <strong>Log in</strong>
                 <p>Access your personal document area.</p>
               </div>
-            </div>
-            <div className="panel-item">
-              <span>03</span>
-              <div>
-                <strong>View PDFs</strong>
-                <p>See the documents linked to your account.</p>
-              </div>
-            </div>
+            </button>
           </div>
         </div>
       </section>
@@ -265,8 +338,15 @@ function AuthPage({ mode, onSuccess, session, onNavigate }) {
           };
 
       const result = isSignup ? await signup(payload) : await login(payload);
+
+      if (isSignup) {
+        onNavigate('login');
+        return;
+      }
+
       const nextSession = {
         userId: Number(result.user_id),
+        accessToken: result.access_token,
         name: result.name || form.name.trim(),
         email: result.email,
       };
@@ -286,6 +366,14 @@ function AuthPage({ mode, onSuccess, session, onNavigate }) {
 
   return (
     <main className="page auth-page">
+      <div className="auth-nav">
+        <button className="auth-back-button" type="button" onClick={() => onNavigate('dashboard')}>
+          <span className="auth-back-icon" aria-hidden="true">←</span>
+          <span>Back to dashboard</span>
+        </button>
+        <span className="auth-nav-label">LexGov secure access</span>
+      </div>
+
       <div className="auth-shell">
         <section className="auth-brand card-surface">
           <button className="brand-mark brand-mark-large brand-button" type="button" onClick={() => onNavigate('landing')}>
@@ -363,7 +451,327 @@ function AuthPage({ mode, onSuccess, session, onNavigate }) {
   );
 }
 
-function DashboardPage({ session, onLogout, onNavigate }) {
+function DocumentReviewPage({ session, selectedDocument, onBack, onLogout }) {
+  const [chatInput, setChatInput] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [copiedCitation, setCopiedCitation] = useState('');
+  const [suggestedQuestions, setSuggestedQuestions] = useState([]);
+  const [suggestionsLoading, setSuggestionsLoading] = useState(true);
+  const [pdfUrl, setPdfUrl] = useState('');
+  const [pdfLoading, setPdfLoading] = useState(false);
+  const [simplifyingId, setSimplifyingId] = useState('');
+  const [chatMessages, setChatMessages] = useState([
+    {
+      id: `welcome-${selectedDocument.unique_identifier_name}`,
+      sender: 'assistant',
+      text: `You are now reviewing ${selectedDocument.pdf_name}. Ask a question about the document, clauses, duties, deadlines, or legal meaning.`,
+    },
+  ]);
+
+  useEffect(() => {
+    let active = true;
+    setSuggestionsLoading(true);
+    fetchSuggestedQuestions(selectedDocument.id)
+      .then((response) => {
+        if (active) {
+          setSuggestedQuestions(response.questions || []);
+        }
+      })
+      .catch(() => {
+        if (active) {
+          setSuggestedQuestions([]);
+        }
+      })
+      .finally(() => {
+        if (active) {
+          setSuggestionsLoading(false);
+        }
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [selectedDocument.id]);
+
+  useEffect(() => () => {
+    if (pdfUrl) {
+      URL.revokeObjectURL(pdfUrl);
+    }
+  }, [pdfUrl]);
+
+  async function togglePdf() {
+    if (pdfUrl) {
+      URL.revokeObjectURL(pdfUrl);
+      setPdfUrl('');
+      return;
+    }
+
+    try {
+      setPdfLoading(true);
+      setError('');
+      const blob = await fetchDocumentPdf(selectedDocument.id);
+      setPdfUrl(URL.createObjectURL(blob));
+    } catch (requestError) {
+      setError(requestError.message || 'Unable to load the original PDF.');
+    } finally {
+      setPdfLoading(false);
+    }
+  }
+
+  async function submitQuestion(question) {
+    const trimmedQuestion = question.trim();
+    if (!trimmedQuestion || loading) {
+      return;
+    }
+
+    const userMessage = {
+      id: `${selectedDocument.unique_identifier_name}-${Date.now()}-user`,
+      sender: 'user',
+      text: trimmedQuestion,
+    };
+
+    setChatMessages((current) => [...current, userMessage]);
+    setChatInput('');
+    setError('');
+    setLoading(true);
+
+    try {
+      const response = await askDocumentQuestion(selectedDocument.id, trimmedQuestion);
+      setChatMessages((current) => [
+        ...current,
+        {
+          id: `${selectedDocument.unique_identifier_name}-${Date.now()}-assistant`,
+          sender: 'assistant',
+          text: response.answer,
+          sources: response.sources || [],
+          answerId: response.answer_id || '',
+          question: trimmedQuestion,
+        },
+      ]);
+    } catch (requestError) {
+      setError(requestError.message || 'Unable to answer this question.');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function handleSubmitQuestion(event) {
+    event.preventDefault();
+    submitQuestion(chatInput);
+  }
+
+  async function handleSimplerAnswer(message) {
+    if (!message.answerId || simplifyingId) {
+      return;
+    }
+
+    try {
+      setSimplifyingId(message.id);
+      setError('');
+      const response = await simplifyDocumentAnswer(selectedDocument.id, message.answerId);
+      setChatMessages((current) => current.map((item) => (
+        item.id === message.id
+          ? { ...item, text: response.answer, simplified: true }
+          : item
+      )));
+    } catch (requestError) {
+      setError(requestError.message || 'Unable to simplify this answer.');
+    } finally {
+      setSimplifyingId('');
+    }
+  }
+
+  async function handleCopyCitation(source, citationId) {
+    const citation = [
+      `Section ${source.section_number || 'Unavailable'}`,
+      source.title,
+      source.page ? `Page ${source.page}` : '',
+    ]
+      .filter(Boolean)
+      .join(': ')
+      .replace(': Page', ' - Page');
+
+    try {
+      await navigator.clipboard.writeText(citation);
+      setCopiedCitation(citationId);
+      window.setTimeout(() => setCopiedCitation(''), 1600);
+    } catch {
+      setError('Unable to copy the citation.');
+    }
+  }
+
+  return (
+    <main className="page document-review-page">
+      <header className="topbar document-review-topbar">
+        <div>
+          <button className="brand-mark brand-button" type="button" onClick={() => onBack()}>
+            LexGov
+          </button>
+          <p className="topbar-subtitle">Document review workspace</p>
+        </div>
+        <div className="topbar-actions">
+          <div className="user-pill">
+            <strong>{session.name}</strong>
+            <span>{session.email}</span>
+          </div>
+          <button className="secondary-button compact-button" type="button" onClick={onBack}>
+            Back to files
+          </button>
+          <button className="secondary-button" type="button" onClick={onLogout}>
+            Log out
+          </button>
+        </div>
+      </header>
+
+      <section className={`document-review-shell card-glass ${pdfUrl ? 'with-pdf' : ''}`}>
+        <aside className="document-info-panel">
+          <p className="eyebrow">Legal document</p>
+          <h1>{selectedDocument.pdf_name}</h1>
+          <div className="document-meta-block">
+            <span className="meta-pill">PDF</span>
+            <span className="meta-pill">Secure review</span>
+          </div>
+          <p>
+            Ask legal questions about this uploaded document and review AI-generated answers in a
+            focused, full-screen workspace.
+          </p>
+          <div className="info-card">
+            <strong>Suggested questions</strong>
+            {suggestionsLoading ? (
+              <p className="suggestions-status">Reading this document...</p>
+            ) : suggestedQuestions.length > 0 ? (
+              <div className="suggested-question-list">
+                {suggestedQuestions.map((question) => (
+                  <button
+                    className="suggested-question"
+                    type="button"
+                    key={question}
+                    onClick={() => {
+                      setChatInput(question);
+                      submitQuestion(question);
+                    }}
+                    disabled={loading}
+                  >
+                    {question}
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <p className="suggestions-status">Ask anything about this document.</p>
+            )}
+          </div>
+        </aside>
+
+        <div className="document-chat-panel">
+          <div className="chat-header">
+            <div>
+              <p className="eyebrow">Document review</p>
+              <h2>{selectedDocument.pdf_name}</h2>
+            </div>
+            <div className="chat-header-actions">
+              <button className="secondary-button compact-button" type="button" onClick={togglePdf} disabled={pdfLoading}>
+                {pdfLoading ? 'Loading PDF...' : pdfUrl ? 'Close PDF' : 'View Original PDF'}
+              </button>
+              <button className="secondary-button compact-button" type="button" onClick={onBack}>
+                Exit review
+              </button>
+            </div>
+          </div>
+
+          <div className="chat-thread">
+            {chatMessages.map((message) => (
+              <div key={message.id} className={`chat-bubble ${message.sender}`}>
+                <span className="chat-role">{message.sender === 'user' ? 'You' : 'Legal AI'}</span>
+                <p>{message.text}</p>
+                {message.sender === 'assistant' && message.answerId && (
+                  <button
+                    className="simpler-button"
+                    type="button"
+                    onClick={() => handleSimplerAnswer(message)}
+                    disabled={simplifyingId === message.id}
+                  >
+                    {simplifyingId === message.id
+                      ? 'Simplifying...'
+                      : message.simplified
+                        ? 'Explained simply'
+                        : 'Explain Simpler'}
+                  </button>
+                )}
+                {message.sources?.length > 0 && (
+                  <div className="chat-sources">
+                    <strong>Sources from this document</strong>
+                    {message.sources.map((source, index) => (
+                      <div className="chat-source" key={`${message.id}-source-${index}`}>
+                        <div className="chat-source-heading">
+                          <span>
+                            Section {source.section_number || 'Unavailable'}
+                            {source.title ? `: ${source.title}` : ''}
+                            {source.page ? ` (page ${source.page})` : ''}
+                          </span>
+                          <button
+                            className="copy-citation-button"
+                            type="button"
+                            onClick={() => handleCopyCitation(source, `${message.id}-${index}`)}
+                            aria-label="Copy citation"
+                          >
+                            {copiedCitation === `${message.id}-${index}` ? 'Copied' : 'Copy citation'}
+                          </button>
+                        </div>
+                        <small>{source.text}</small>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            ))}
+            {loading && (
+              <div className="chat-bubble assistant loading-message" aria-live="polite">
+                <span className="chat-role">Legal AI</span>
+                <div className="typing-indicator" aria-label="Generating response">
+                  <span />
+                  <span />
+                  <span />
+                </div>
+              </div>
+            )}
+          </div>
+
+          {error && <div className="form-alert">{error}</div>}
+          <form className="chat-input-row" onSubmit={handleSubmitQuestion}>
+            <input
+              type="text"
+              value={chatInput}
+              onChange={(event) => setChatInput(event.target.value)}
+              placeholder="Ask about this legal document..."
+              aria-label="Ask a question about the uploaded document"
+            />
+            <button className="primary-button" type="submit" disabled={!chatInput.trim() || loading}>
+              {loading ? 'Searching...' : 'Ask'}
+            </button>
+          </form>
+        </div>
+
+        {pdfUrl && (
+          <aside className="pdf-viewer-panel">
+            <div className="pdf-viewer-header">
+              <div>
+                <p className="eyebrow">Original file</p>
+                <h2>PDF viewer</h2>
+              </div>
+              <button className="secondary-button compact-button" type="button" onClick={togglePdf}>
+                Close PDF
+              </button>
+            </div>
+            <iframe className="pdf-viewer" title={`Original PDF: ${selectedDocument.pdf_name}`} src={pdfUrl} />
+          </aside>
+        )}
+      </section>
+    </main>
+  );
+}
+
+function DashboardPage({ session, onLogout, onNavigate, onOpenDocument }) {
   const [documents, setDocuments] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -377,7 +785,7 @@ function DashboardPage({ session, onLogout, onNavigate }) {
     try {
       setLoading(true);
       setError('');
-      const response = await fetchDocuments(session.userId);
+      const response = await fetchDocuments();
       setDocuments(response.documents || []);
     } catch (error) {
       setError(error.message || 'Unable to load documents');
@@ -393,7 +801,7 @@ function DashboardPage({ session, onLogout, onNavigate }) {
       try {
         setLoading(true);
         setError('');
-        const response = await fetchDocuments(session.userId);
+        const response = await fetchDocuments();
         if (active) {
           setDocuments(response.documents || []);
         }
@@ -431,20 +839,31 @@ function DashboardPage({ session, onLogout, onNavigate }) {
     try {
       setUploading(true);
       setUploadStatus({ type: '', message: '' });
-      await uploadDocument(session.userId, selectedFile);
+      await uploadDocument(selectedFile);
       await refreshDocuments();
-      setShowUploadForm(false);
-      setSelectedFile(null);
-
-      if (fileInputRef.current) {
-        fileInputRef.current.value = '';
-      }
-
       setUploadStatus({ type: 'success', message: 'PDF uploaded successfully.' });
     } catch (error) {
       setUploadStatus({ type: 'error', message: error.message || 'Upload failed.' });
     } finally {
       setUploading(false);
+    }
+  }
+
+  function handleFileSelection(file) {
+    setSelectedFile(file || null);
+    setUploadStatus({ type: '', message: '' });
+  }
+
+  function handleFileDrop(event) {
+    event.preventDefault();
+    handleFileSelection(event.dataTransfer.files?.[0]);
+  }
+
+  function resetUploadForm() {
+    setSelectedFile(null);
+    setUploadStatus({ type: '', message: '' });
+    if (fileInputRef.current) {
+      fileInputRef.current.value = '';
     }
   }
 
@@ -462,9 +881,6 @@ function DashboardPage({ session, onLogout, onNavigate }) {
             <strong>{session.name}</strong>
             <span>{session.email}</span>
           </div>
-          <button className="primary-button" type="button" onClick={() => setShowUploadForm((current) => !current)}>
-            {showUploadForm ? 'Close upload' : 'Add PDF'}
-          </button>
           <button className="secondary-button" type="button" onClick={onLogout}>
             Log out
           </button>
@@ -490,40 +906,6 @@ function DashboardPage({ session, onLogout, onNavigate }) {
             </div>
           </div>
 
-          <button className="secondary-button upload-trigger" type="button" onClick={() => setShowUploadForm((current) => !current)}>
-            {showUploadForm ? 'Hide upload form' : 'Add PDF'}
-          </button>
-
-          {showUploadForm && (
-            <form className="upload-card" onSubmit={handleUploadSubmit}>
-              <label className="upload-field">
-                Select PDF
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  accept="application/pdf,.pdf"
-                  onChange={(event) => {
-                    const file = event.target.files?.[0] || null;
-                    setSelectedFile(file);
-                    setUploadStatus({ type: '', message: '' });
-                  }}
-                  required
-                />
-              </label>
-
-              <p className="upload-help">Upload a PDF to link it to this account and generate the parsed JSON record automatically.</p>
-
-              {uploadStatus.message && (
-                <div className={`upload-status ${uploadStatus.type}`}>
-                  {uploadStatus.message}
-                </div>
-              )}
-
-              <button className="primary-button submit-button" type="submit" disabled={uploading}>
-                {uploading ? 'Uploading...' : 'Upload PDF'}
-              </button>
-            </form>
-          )}
         </aside>
 
         <section className="documents-panel card-glass">
@@ -532,8 +914,84 @@ function DashboardPage({ session, onLogout, onNavigate }) {
               <p className="eyebrow">Your files</p>
               <h2>PDF list</h2>
             </div>
-            <span className="panel-chip">User-specific</span>
+            <div className="document-list-actions">
+              <span className="panel-chip">User-specific</span>
+              <button
+                className="upload-icon-button"
+                type="button"
+                onClick={() => setShowUploadForm((current) => !current)}
+                aria-label={showUploadForm ? 'Close PDF upload form' : 'Upload a PDF'}
+                title={showUploadForm ? 'Close PDF upload form' : 'Upload a PDF'}
+              >
+                {showUploadForm ? '×' : '+'}
+              </button>
+            </div>
           </div>
+
+          {showUploadForm && (
+            <form className="upload-card list-upload-card" onSubmit={handleUploadSubmit}>
+              <label
+                className={`upload-dropzone ${selectedFile ? 'has-file' : ''} ${uploading ? 'is-uploading' : ''} ${uploadStatus.type === 'success' ? 'is-complete' : ''}`}
+                htmlFor="document-file-input"
+                onDragOver={(event) => event.preventDefault()}
+                onDrop={handleFileDrop}
+              >
+                <span className="upload-dropzone-icon">
+                  {uploadStatus.type === 'success' ? '✓' : 'PDF'}
+                </span>
+                <span className="upload-dropzone-copy">
+                  <strong>{selectedFile ? selectedFile.name : 'Add a legal PDF'}</strong>
+                  <span>
+                    {uploading
+                      ? 'Uploading and parsing your document...'
+                      : uploadStatus.type === 'success'
+                        ? 'Upload complete'
+                        : selectedFile
+                          ? 'Ready to upload'
+                          : 'Click to browse or drag and drop here'}
+                  </span>
+                </span>
+                {uploading && <span className="upload-spinner" aria-hidden="true" />}
+                <input
+                  ref={fileInputRef}
+                  id="document-file-input"
+                  className="upload-file-input"
+                  type="file"
+                  accept="application/pdf,.pdf"
+                  onChange={(event) => handleFileSelection(event.target.files?.[0])}
+                  required
+                />
+              </label>
+
+              <p className="upload-help">Upload a PDF to parse it and add it to your private document list.</p>
+
+              {uploadStatus.type === 'success' && (
+                <div className="upload-feedback upload-feedback-success" role="status">
+                  <span className="upload-feedback-icon">✓</span>
+                  <span>
+                    <strong>PDF added successfully</strong>
+                    <small>Your document is now available in the list below.</small>
+                  </span>
+                </div>
+              )}
+
+              {uploadStatus.type === 'error' && uploadStatus.message && (
+                <div className={`upload-status ${uploadStatus.type}`}>
+                  {uploadStatus.message}
+                </div>
+              )}
+
+              {uploadStatus.type === 'success' ? (
+                <button className="secondary-button submit-button" type="button" onClick={resetUploadForm}>
+                  Upload another PDF
+                </button>
+              ) : (
+                <button className="primary-button submit-button" type="submit" disabled={uploading}>
+                  {uploading ? 'Uploading...' : 'Upload PDF'}
+                </button>
+              )}
+            </form>
+          )}
 
           {loading && <div className="empty-state">Loading your documents...</div>}
           {error && <div className="form-alert">{error}</div>}
@@ -547,13 +1005,18 @@ function DashboardPage({ session, onLogout, onNavigate }) {
           {!loading && !error && documents.length > 0 && (
             <div className="document-grid">
               {documents.map((document) => (
-                <article className="document-card" key={document.unique_identifier_name}>
+                <button
+                  type="button"
+                  className="document-card"
+                  key={document.unique_identifier_name}
+                  onClick={() => onOpenDocument(document)}
+                >
                   <div className="document-icon">PDF</div>
                   <div>
                     <h3>{document.pdf_name}</h3>
                     <p>Stored securely in your account.</p>
                   </div>
-                </article>
+                </button>
               ))}
             </div>
           )}

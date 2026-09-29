@@ -20,8 +20,17 @@ class DocumentRecord(TypedDict):
 
 
 class DocumentListItem(TypedDict):
+	id: int
 	pdf_name: str
 	unique_identifier_name: str
+	pdf_filename: str
+	json_filename: str
+
+
+class DocumentAccessRecord(TypedDict):
+	id: int
+	user_id: int
+	pdf_name: str
 	pdf_filename: str
 	json_filename: str
 
@@ -158,6 +167,7 @@ def list_documents_for_user(user_id: int) -> list[DocumentListItem]:
 			cursor.execute(
 				"""
 				SELECT
+					id,
 					COALESCE(pdf_name, original_filename),
 					COALESCE(unique_identifier_name, document_key),
 					pdf_filename,
@@ -172,10 +182,36 @@ def list_documents_for_user(user_id: int) -> list[DocumentListItem]:
 
 	return [
 		{
-			"pdf_name": cast(str, row[0]),
-			"unique_identifier_name": cast(str, row[1]),
-			"pdf_filename": cast(str, row[2]),
-			"json_filename": cast(str, row[3]),
+			"id": cast(int, row[0]),
+			"pdf_name": cast(str, row[1]),
+			"unique_identifier_name": cast(str, row[2]),
+			"pdf_filename": cast(str, row[3]),
+			"json_filename": cast(str, row[4]),
 		}
 		for row in rows
 	]
+
+
+def get_document_for_user(document_id: int, user_id: int) -> DocumentAccessRecord | None:
+	with get_document_connection() as connection:
+		with connection.cursor() as cursor:
+			cursor.execute(
+				"""
+				SELECT id, user_id, COALESCE(pdf_name, original_filename), pdf_filename, json_filename
+				FROM documents
+				WHERE id = %s AND user_id = %s
+				""",
+				(document_id, user_id),
+			)
+			row = cursor.fetchone()
+
+	if row is None:
+		return None
+
+	return {
+		"id": cast(int, row[0]),
+		"user_id": cast(int, row[1]),
+		"pdf_name": cast(str, row[2]),
+		"pdf_filename": cast(str, row[3]),
+		"json_filename": cast(str, row[4]),
+	}

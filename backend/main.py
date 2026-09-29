@@ -1,22 +1,34 @@
+import json
+from uuid import uuid4
 from pathlib import Path
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from dotenv import load_dotenv
 from pydantic import BaseModel, EmailStr
 
 from general_logic.auth import (
+	create_access_token,
+	get_current_user_id,
 	initialize_database,
 	login_user,
 	signup_user,
 )
 from general_logic.documents import (
 	build_document_filenames,
+	get_document_for_user,
 	initialize_document_storage,
 	list_documents_for_user,
 	store_document,
 )
 from parser import parse_document_to_json
+from general_logic.retrieval import load_document_json, retrieve_sections
+from general_logic.llm import (
+	generate_document_explanation,
+	generate_simpler_explanation,
+	generate_suggested_questions,
+)
 
 
 load_dotenv()
@@ -39,6 +51,38 @@ class SignupRequest(BaseModel):
 class LoginRequest(BaseModel):
 	email: EmailStr
 	password: str
+
+
+class AskDocumentRequest(BaseModel):
+	question: str
+
+
+class SimplerExplanationRequest(BaseModel):
+	answer_id: str
+
+
+_SUGGESTION_CACHE: dict[tuple[int, str], list[str]] = {}
+_ANSWER_CONTEXT_CACHE: dict[str, tuple[int, int, str, list[dict[str, object]]]] = {}
+
+
+def _fallback_suggested_questions(document_data: dict[str, object]) -> list[str]:
+	questions: list[str] = []
+	seen_titles: set[str] = set()
+	sections = document_data.get("sections", [])
+	if not isinstance(sections, list):
+		return questions
+	for section in sections:
+		if not isinstance(section, dict):
+			continue
+		title = str(section.get("title") or section.get("heading") or "").strip().rstrip(".")
+		number = str(section.get("section_number") or "").strip()
+		if not title or title.lower() in seen_titles:
+			continue
+		seen_titles.add(title.lower())
+		questions.append(f"What does Section {number} say about {title}?" if number else f"What does the document say about {title}?")
+		if len(questions) == 5:
+			break
+	return questions
 
 
 @app.on_event("startup")
@@ -78,16 +122,18 @@ def login(payload: LoginRequest) -> dict[str, str]:
 	return {
 		"message": "Login successful",
 		"user_id": str(user["id"]),
+		"access_token": create_access_token(user["id"]),
+		"token_type": "bearer",
 		"name": user["name"],
 		"email": user["email"],
 	}
 
 
 @app.post("/parse-document")
-def parse_document(user_id: int = Form(...), file: UploadFile = File(...)) -> dict[str, object]:
-	if user_id <= 0:
-		raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Please provide a valid user_id")
-
+def parse_document(
+	file: UploadFile = File(...),
+	user_id: int = Depends(get_current_user_id),
+) -> dict[str, object]:
 	if not file.filename or not file.filename.lower().endswith(".pdf"):
 		raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Please upload a PDF file")
 
@@ -125,14 +171,148 @@ def parse_document(user_id: int = Form(...), file: UploadFile = File(...)) -> di
 		raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
 
 
-@app.get("/documents/{user_id}")
-def list_user_documents(user_id: int) -> dict[str, object]:
-	if user_id <= 0:
-		raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Please provide a valid user_id")
-
+@app.get("/documents")
+def list_user_documents(user_id: int = Depends(get_current_user_id)) -> dict[str, object]:
 	documents = list_documents_for_user(user_id)
 	return {
 		"message": "Documents retrieved successfully",
 		"documents": documents,
 	}
+
+
+@app.get("/documents/{document_id}/suggested-questions")
+def suggested_questions(
+	document_id: int,
+	user_id: int = Depends(get_current_user_id),
+) -> dict[str, object]:
+	document = get_document_for_user(document_id, user_id)
+	if document is None:
+		raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+	try:
+		document_data = load_document_json(document["json_filename"])
+	except (FileNotFoundError, ValueError, json.JSONDecodeError) as exc:
+		raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
+
+	cache_key = (user_id, document["json_filename"])
+	if cache_key in _SUGGESTION_CACHE:
+		return {"questions": _SUGGESTION_CACHE[cache_key]}
+
+	sections = document_data.get("sections", [])
+	if not isinstance(sections, list):
+		return {"questions": []}
+	question_seed = "purpose rights duties obligations procedure time limit penalties appeal exemptions"
+	relevant_sections = retrieve_sections(document_data, question_seed, top_k=10, candidate_k=20)
+	if not relevant_sections:
+		relevant_sections = [section for section in sections if isinstance(section, dict)][:10]
+	try:
+		questions = generate_suggested_questions(relevant_sections, document["pdf_name"])
+	except (RuntimeError, ValueError, json.JSONDecodeError):
+		questions = _fallback_suggested_questions(document_data)
+
+	_SUGGESTION_CACHE[cache_key] = questions[:6]
+	return {"questions": _SUGGESTION_CACHE[cache_key]}
+
+
+@app.get("/documents/{document_id}/pdf")
+def get_document_pdf(
+	document_id: int,
+	user_id: int = Depends(get_current_user_id),
+) -> FileResponse:
+	document = get_document_for_user(document_id, user_id)
+	if document is None:
+		raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+	pdf_path = Path("pdf_storage") / Path(document["pdf_filename"]).name
+	if not pdf_path.is_file():
+		raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Original PDF not found")
+	return FileResponse(pdf_path, media_type="application/pdf", filename=document["pdf_name"])
+
+
+@app.post("/documents/{document_id}/ask")
+def ask_document_question(
+	document_id: int,
+	payload: AskDocumentRequest,
+	user_id: int = Depends(get_current_user_id),
+) -> dict[str, object]:
+	question = payload.question.strip()
+	if document_id <= 0:
+		raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Please provide a valid document ID")
+	if not question:
+		raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Please ask a question")
+	if len(question) > 2000:
+		raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Question is too long")
+
+	document = get_document_for_user(document_id, user_id)
+	if document is None:
+		raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+	try:
+		document_data = load_document_json(document["json_filename"])
+		retrieved_sections = retrieve_sections(document_data, question)
+	except (FileNotFoundError, ValueError, json.JSONDecodeError) as exc:
+		raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
+
+	if not retrieved_sections:
+		return {
+			"document": {"id": document["id"], "name": document["pdf_name"]},
+			"answer": "I could not find sufficient information about that question in this document.",
+			"found_information": False,
+			"sources": [],
+		}
+
+	try:
+		answer, found_information = generate_document_explanation(
+			question,
+			retrieved_sections,
+			document["pdf_name"],
+		)
+	except RuntimeError as exc:
+		raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+
+	sources = [
+		{
+			"section_number": section.get("section_number", ""),
+			"title": section.get("title", ""),
+			"page": section.get("page_number"),
+			"text": section.get("content", ""),
+		}
+		for section in retrieved_sections
+	]
+	answer_id = uuid4().hex
+	_ANSWER_CONTEXT_CACHE[answer_id] = (user_id, document_id, question, retrieved_sections)
+	return {
+		"document": {"id": document["id"], "name": document["pdf_name"]},
+		"answer_id": answer_id,
+		"answer": answer,
+		"found_information": found_information,
+		"sources": sources,
+	}
+
+
+@app.post("/documents/{document_id}/simpler")
+def simplify_document_answer(
+	document_id: int,
+	payload: SimplerExplanationRequest,
+	user_id: int = Depends(get_current_user_id),
+) -> dict[str, object]:
+	document = get_document_for_user(document_id, user_id)
+	if document is None:
+		raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+	context = _ANSWER_CONTEXT_CACHE.get(payload.answer_id)
+	if context is None or context[0] != user_id or context[1] != document_id:
+		raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Answer context not found")
+
+	_, _, question, retrieved_sections = context
+	try:
+		answer, found_information = generate_simpler_explanation(
+			question,
+			retrieved_sections,
+			document["pdf_name"],
+		)
+	except RuntimeError as exc:
+		raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
+
+	return {"answer": answer, "found_information": found_information}
 

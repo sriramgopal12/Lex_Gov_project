@@ -1,9 +1,13 @@
 import os
+from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 from typing import TypedDict, cast
 
 import bcrypt
+import jwt
 import psycopg
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 
 class UserRecord(TypedDict):
@@ -14,6 +18,47 @@ class UserRecord(TypedDict):
 
 class UserLoginRecord(UserRecord):
     password_hash: str
+
+
+_bearer_scheme = HTTPBearer()
+
+
+def _jwt_secret() -> str:
+    secret = os.getenv("JWT_SECRET_KEY")
+    if not secret:
+        raise RuntimeError("JWT_SECRET_KEY is not set")
+    return secret
+
+
+def create_access_token(user_id: int) -> str:
+    expires_minutes = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
+    payload = {
+        "sub": str(user_id),
+        "exp": datetime.now(timezone.utc) + timedelta(minutes=expires_minutes),
+    }
+    return jwt.encode(payload, _jwt_secret(), algorithm="HS256")
+
+
+def get_current_user_id(
+    credentials: HTTPAuthorizationCredentials = Depends(_bearer_scheme),
+) -> int:
+    try:
+        payload = jwt.decode(credentials.credentials, _jwt_secret(), algorithms=["HS256"])
+        user_id = int(payload["sub"])
+    except (jwt.InvalidTokenError, KeyError, TypeError, ValueError, RuntimeError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired authentication token",
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from exc
+
+    if user_id <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return user_id
 
 
 def _password_exceeds_bcrypt_limit(password: str) -> bool:

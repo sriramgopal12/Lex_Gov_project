@@ -52,7 +52,7 @@ def _extract_metadata(text: str) -> dict[str, str]:
 
 def _parse_sections(text: str) -> list[dict[str, Any]]:
     sections: list[dict[str, Any]] = []
-    pattern = re.compile(r"\b(section|sec\.?|s\.)\s*(\d+[A-Za-z]?)\b", re.I)
+    pattern = re.compile(r"^\s*(\d{1,3}[A-Za-z]?)\.\s+(.+?)\s*$")
 
     lines = text.splitlines()
     current_section: dict[str, Any] | None = None
@@ -65,15 +65,15 @@ def _parse_sections(text: str) -> list[dict[str, Any]]:
                 current_lines.append("")
             continue
 
-        match = pattern.search(stripped)
+        match = pattern.match(stripped)
         if match:
             if current_section is not None:
                 current_section["content"] = "\n".join(current_lines).strip()
                 sections.append(current_section)
 
             current_section = {
-                "section_number": match.group(2),
-                "title": stripped.replace(match.group(0), "", 1).strip(),
+                "section_number": match.group(1),
+                "title": match.group(2).strip(),
                 "content": "",
             }
             current_lines = []
