@@ -49,6 +49,22 @@ export function fetchDocuments() {
   return request('/documents');
 }
 
+export function fetchDocumentStatus(documentId) {
+  return request(`/documents/${documentId}/status`);
+}
+
+export function fetchChatHistory(documentId) {
+  return request(`/documents/${documentId}/chat-history`);
+}
+
+export function deleteDocument(documentId) {
+  return request(`/documents/${documentId}`, { method: 'DELETE' });
+}
+
+export function deleteChat(documentId, chatId) {
+  return request(`/documents/${documentId}/chat-history/${chatId}`, { method: 'DELETE' });
+}
+
 export function uploadDocument(file) {
   const formData = new FormData();
   formData.append('file', file);

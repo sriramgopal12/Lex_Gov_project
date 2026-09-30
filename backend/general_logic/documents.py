@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import logging
 from contextlib import contextmanager
 from pathlib import Path
 from typing import TypedDict, cast
 from uuid import uuid4
 
 from general_logic.auth import get_connection
+
+
+logger = logging.getLogger(__name__)
 
 
 class DocumentRecord(TypedDict):
@@ -17,6 +21,9 @@ class DocumentRecord(TypedDict):
 	document_key: str
 	pdf_filename: str
 	json_filename: str
+	status: str
+	stage: str
+	processing_error: str | None
 
 
 class DocumentListItem(TypedDict):
@@ -25,6 +32,9 @@ class DocumentListItem(TypedDict):
 	unique_identifier_name: str
 	pdf_filename: str
 	json_filename: str
+	status: str
+	stage: str
+	processing_error: str | None
 
 
 class DocumentAccessRecord(TypedDict):
@@ -33,6 +43,9 @@ class DocumentAccessRecord(TypedDict):
 	pdf_name: str
 	pdf_filename: str
 	json_filename: str
+	status: str
+	stage: str
+	processing_error: str | None
 
 
 DOCUMENT_TABLE_SQL = """
@@ -45,7 +58,10 @@ CREATE TABLE IF NOT EXISTS documents (
 	document_key VARCHAR(80) NOT NULL UNIQUE,
 	pdf_filename VARCHAR(255) NOT NULL,
 	json_filename VARCHAR(255) NOT NULL,
-	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+	created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+	status VARCHAR(32) NOT NULL DEFAULT 'completed',
+	stage VARCHAR(32) NOT NULL DEFAULT 'completed',
+	processing_error TEXT
 )
 """
 
@@ -89,6 +105,14 @@ def initialize_document_storage() -> None:
 			cursor.execute(
 				"""
 				ALTER TABLE documents
+				ADD COLUMN IF NOT EXISTS status VARCHAR(32) NOT NULL DEFAULT 'completed',
+				ADD COLUMN IF NOT EXISTS stage VARCHAR(32) NOT NULL DEFAULT 'completed',
+				ADD COLUMN IF NOT EXISTS processing_error TEXT
+				"""
+			)
+			cursor.execute(
+				"""
+				ALTER TABLE documents
 				ALTER COLUMN pdf_name SET NOT NULL,
 				ALTER COLUMN unique_identifier_name SET NOT NULL
 				"""
@@ -116,6 +140,9 @@ def store_document(
 	document_key: str,
 	pdf_filename: str,
 	json_filename: str,
+	status: str = "completed",
+	stage: str = "completed",
+	processing_error: str | None = None,
 ) -> DocumentRecord:
 	with get_document_connection() as connection:
 		with connection.cursor() as cursor:
@@ -128,9 +155,12 @@ def store_document(
 					original_filename,
 					document_key,
 					pdf_filename,
-					json_filename
+					json_filename,
+					status,
+					stage,
+					processing_error
 				)
-				VALUES (%s, %s, %s, %s, %s, %s, %s)
+				VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
 				RETURNING id, user_id, pdf_name, unique_identifier_name, original_filename, document_key, pdf_filename, json_filename
 				""",
 				(
@@ -141,6 +171,9 @@ def store_document(
 					document_key,
 					pdf_filename,
 					json_filename,
+					status,
+					stage,
+					processing_error,
 				),
 			)
 			document = cursor.fetchone()
@@ -158,7 +191,30 @@ def store_document(
 		"document_key": key,
 		"pdf_filename": stored_pdf,
 		"json_filename": stored_json,
+		"status": status,
+		"stage": stage,
+		"processing_error": processing_error,
 	}
+
+
+def update_document_status(
+	document_id: int,
+	user_id: int,
+	status: str,
+	stage: str,
+	processing_error: str | None = None,
+) -> bool:
+	with get_document_connection() as connection:
+		with connection.cursor() as cursor:
+			cursor.execute(
+				"""
+				UPDATE documents
+				SET status = %s, stage = %s, processing_error = %s
+				WHERE id = %s AND user_id = %s
+				""",
+				(status, stage, processing_error, document_id, user_id),
+			)
+			return cursor.rowcount == 1
 
 
 def list_documents_for_user(user_id: int) -> list[DocumentListItem]:
@@ -171,7 +227,10 @@ def list_documents_for_user(user_id: int) -> list[DocumentListItem]:
 					COALESCE(pdf_name, original_filename),
 					COALESCE(unique_identifier_name, document_key),
 					pdf_filename,
-					json_filename
+					json_filename,
+					status,
+					stage,
+					processing_error
 				FROM documents
 				WHERE user_id = %s
 				ORDER BY created_at DESC
@@ -187,6 +246,9 @@ def list_documents_for_user(user_id: int) -> list[DocumentListItem]:
 			"unique_identifier_name": cast(str, row[2]),
 			"pdf_filename": cast(str, row[3]),
 			"json_filename": cast(str, row[4]),
+			"status": cast(str, row[5]),
+			"stage": cast(str, row[6]),
+			"processing_error": cast(str | None, row[7]),
 		}
 		for row in rows
 	]
@@ -197,7 +259,7 @@ def get_document_for_user(document_id: int, user_id: int) -> DocumentAccessRecor
 		with connection.cursor() as cursor:
 			cursor.execute(
 				"""
-				SELECT id, user_id, COALESCE(pdf_name, original_filename), pdf_filename, json_filename
+				SELECT id, user_id, COALESCE(pdf_name, original_filename), pdf_filename, json_filename, status, stage, processing_error
 				FROM documents
 				WHERE id = %s AND user_id = %s
 				""",
@@ -214,4 +276,44 @@ def get_document_for_user(document_id: int, user_id: int) -> DocumentAccessRecor
 		"pdf_name": cast(str, row[2]),
 		"pdf_filename": cast(str, row[3]),
 		"json_filename": cast(str, row[4]),
+		"status": cast(str, row[5]),
+		"stage": cast(str, row[6]),
+		"processing_error": cast(str | None, row[7]),
 	}
+
+
+def _document_storage_path(storage_dir: str, filename: str) -> Path:
+	root = Path(storage_dir).resolve()
+	path = (root / Path(filename).name).resolve()
+	if path.parent != root:
+		raise ValueError("Document storage path is invalid")
+	return path
+
+
+def delete_document_for_user(document_id: int, user_id: int) -> bool:
+	document = get_document_for_user(document_id, user_id)
+	if document is None:
+		return False
+
+	logger.info("Document deletion requested: document_id=%s, user_id=%s", document_id, user_id)
+	for storage_dir, filename in (
+		("pdf_storage", document["pdf_filename"]),
+		("json_storage", document["json_filename"]),
+	):
+		path = _document_storage_path(storage_dir, filename)
+		try:
+			path.unlink(missing_ok=True)
+		except OSError:
+			logger.warning("Unable to remove document resource: document_id=%s", document_id)
+
+	with get_document_connection() as connection:
+		with connection.cursor() as cursor:
+			cursor.execute(
+				"DELETE FROM documents WHERE id = %s AND user_id = %s",
+				(document_id, user_id),
+			)
+			deleted = cursor.rowcount == 1
+
+	if deleted:
+		logger.info("Document deletion completed: document_id=%s", document_id)
+	return deleted

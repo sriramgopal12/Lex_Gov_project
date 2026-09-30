@@ -1,6 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   askDocumentQuestion,
+  deleteChat,
+  deleteDocument,
+  fetchChatHistory,
   fetchDocumentPdf,
   fetchDocuments,
   fetchSuggestedQuestions,
@@ -206,6 +209,23 @@ function getViewFromLocation() {
 function getDocumentIdFromLocation() {
   const match = window.location.pathname.match(/^\/documents\/(\d+)\/chat$/);
   return match ? Number(match[1]) : null;
+}
+
+function formatHistoryTimestamp(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return '';
+  }
+  const today = new Date();
+  const yesterday = new Date();
+  yesterday.setDate(today.getDate() - 1);
+  const dateKey = date.toDateString();
+  const label = dateKey === today.toDateString()
+    ? 'Today'
+    : dateKey === yesterday.toDateString()
+      ? 'Yesterday'
+      : date.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
+  return `${label} · ${date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`;
 }
 
 function setHashRoute(nextView) {
@@ -455,12 +475,17 @@ function DocumentReviewPage({ session, selectedDocument, onBack, onLogout }) {
   const [chatInput, setChatInput] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
   const [copiedCitation, setCopiedCitation] = useState('');
   const [suggestedQuestions, setSuggestedQuestions] = useState([]);
   const [suggestionsLoading, setSuggestionsLoading] = useState(true);
   const [pdfUrl, setPdfUrl] = useState('');
   const [pdfLoading, setPdfLoading] = useState(false);
   const [simplifyingId, setSimplifyingId] = useState('');
+  const [chatHistory, setChatHistory] = useState([]);
+  const [historyLoading, setHistoryLoading] = useState(true);
+  const [deletingChatId, setDeletingChatId] = useState(null);
+  const [activeHistoryId, setActiveHistoryId] = useState(null);
   const [chatMessages, setChatMessages] = useState([
     {
       id: `welcome-${selectedDocument.unique_identifier_name}`,
@@ -468,6 +493,31 @@ function DocumentReviewPage({ session, selectedDocument, onBack, onLogout }) {
       text: `You are now reviewing ${selectedDocument.pdf_name}. Ask a question about the document, clauses, duties, deadlines, or legal meaning.`,
     },
   ]);
+
+  useEffect(() => {
+    let active = true;
+    setHistoryLoading(true);
+    fetchChatHistory(selectedDocument.id)
+      .then((response) => {
+        if (active) {
+          setChatHistory(response.messages || []);
+        }
+      })
+      .catch(() => {
+        if (active) {
+          setChatHistory([]);
+        }
+      })
+      .finally(() => {
+        if (active) {
+          setHistoryLoading(false);
+        }
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [selectedDocument.id]);
 
   useEffect(() => {
     let active = true;
@@ -499,6 +549,57 @@ function DocumentReviewPage({ session, selectedDocument, onBack, onLogout }) {
       URL.revokeObjectURL(pdfUrl);
     }
   }, [pdfUrl]);
+
+  function startNewChat() {
+    setError('');
+    setNotice('');
+    setActiveHistoryId(null);
+    setChatMessages([{
+      id: `welcome-${selectedDocument.unique_identifier_name}-${Date.now()}`,
+      sender: 'assistant',
+      text: `You are now reviewing ${selectedDocument.pdf_name}. Ask a question about the document, clauses, duties, deadlines, or legal meaning.`,
+    }]);
+  }
+
+  function openHistoryItem(item) {
+    setError('');
+    setNotice('');
+    setActiveHistoryId(item.id);
+    setChatMessages([
+      { id: `history-${item.id}-question`, sender: 'user', text: item.question },
+      {
+        id: `history-${item.id}-answer`,
+        sender: 'assistant',
+        text: item.simplified_answer || item.answer,
+        sources: item.sources || [],
+        answerId: item.answer_id || '',
+        question: item.question,
+        simplified: Boolean(item.simplified_answer),
+      },
+    ]);
+  }
+
+  async function handleDeleteChat(item) {
+    if (deletingChatId === item.id || !window.confirm('Delete this chat? Are you sure you want to delete this conversation?')) {
+      return;
+    }
+
+    try {
+      setDeletingChatId(item.id);
+      setError('');
+      await deleteChat(selectedDocument.id, item.id);
+      setChatHistory((current) => current.filter((historyItem) => historyItem.id !== item.id));
+      if (activeHistoryId === item.id) {
+        setActiveHistoryId(null);
+        setChatMessages([]);
+      }
+      setNotice('Chat deleted successfully.');
+    } catch {
+      setError('Unable to delete this chat. Please try again.');
+    } finally {
+      setDeletingChatId(null);
+    }
+  }
 
   async function togglePdf() {
     if (pdfUrl) {
@@ -538,6 +639,10 @@ function DocumentReviewPage({ session, selectedDocument, onBack, onLogout }) {
 
     try {
       const response = await askDocumentQuestion(selectedDocument.id, trimmedQuestion);
+      setActiveHistoryId(response.history_id || null);
+      fetchChatHistory(selectedDocument.id)
+        .then((historyResponse) => setChatHistory(historyResponse.messages || []))
+        .catch(() => {});
       setChatMessages((current) => [
         ...current,
         {
@@ -661,6 +766,38 @@ function DocumentReviewPage({ session, selectedDocument, onBack, onLogout }) {
               <p className="suggestions-status">Ask anything about this document.</p>
             )}
           </div>
+          <div className="info-card history-card">
+            <div className="history-heading">
+              <strong>Chat history</strong>
+              <button className="history-new-button" type="button" onClick={startNewChat}>New chat</button>
+            </div>
+            {historyLoading ? (
+              <p className="suggestions-status">Loading history...</p>
+            ) : chatHistory.length === 0 ? (
+              <p className="suggestions-status">No questions yet.</p>
+            ) : (
+              <div className="history-list">
+                {chatHistory.map((item) => (
+                  <div className={`history-item ${activeHistoryId === item.id ? 'is-active' : ''}`} key={item.id}>
+                    <button className="history-item-content" type="button" onClick={() => openHistoryItem(item)}>
+                      <span>{item.question}</span>
+                      <small>{formatHistoryTimestamp(item.created_at)}</small>
+                    </button>
+                    <button
+                      className="history-delete-button"
+                      type="button"
+                      aria-label={`Delete chat: ${item.question}`}
+                      title="Delete this chat"
+                      onClick={() => handleDeleteChat(item)}
+                      disabled={deletingChatId === item.id}
+                    >
+                      {deletingChatId === item.id ? '...' : 'Delete'}
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
         </aside>
 
         <div className="document-chat-panel">
@@ -670,6 +807,9 @@ function DocumentReviewPage({ session, selectedDocument, onBack, onLogout }) {
               <h2>{selectedDocument.pdf_name}</h2>
             </div>
             <div className="chat-header-actions">
+              <button className="secondary-button compact-button" type="button" onClick={startNewChat}>
+                New chat
+              </button>
               <button className="secondary-button compact-button" type="button" onClick={togglePdf} disabled={pdfLoading}>
                 {pdfLoading ? 'Loading PDF...' : pdfUrl ? 'Close PDF' : 'View Original PDF'}
               </button>
@@ -680,7 +820,14 @@ function DocumentReviewPage({ session, selectedDocument, onBack, onLogout }) {
           </div>
 
           <div className="chat-thread">
-            {chatMessages.map((message) => (
+            {chatMessages.length === 0 ? (
+              <div className="empty-chat-state">
+                <p>No conversation selected.</p>
+                <button className="secondary-button compact-button" type="button" onClick={startNewChat}>
+                  Start New Chat
+                </button>
+              </div>
+            ) : chatMessages.map((message) => (
               <div key={message.id} className={`chat-bubble ${message.sender}`}>
                 <span className="chat-role">{message.sender === 'user' ? 'You' : 'Legal AI'}</span>
                 <p>{message.text}</p>
@@ -737,6 +884,7 @@ function DocumentReviewPage({ session, selectedDocument, onBack, onLogout }) {
             )}
           </div>
 
+          {notice && <div className="upload-status success">{notice}</div>}
           {error && <div className="form-alert">{error}</div>}
           <form className="chat-input-row" onSubmit={handleSubmitQuestion}>
             <input
@@ -779,6 +927,9 @@ function DashboardPage({ session, onLogout, onNavigate, onOpenDocument }) {
   const [selectedFile, setSelectedFile] = useState(null);
   const [uploading, setUploading] = useState(false);
   const [uploadStatus, setUploadStatus] = useState({ type: '', message: '' });
+  const [deletingDocumentId, setDeletingDocumentId] = useState(null);
+  const [documentNotice, setDocumentNotice] = useState('');
+  const [openDocumentMenuId, setOpenDocumentMenuId] = useState(null);
   const fileInputRef = useRef(null);
 
   async function refreshDocuments() {
@@ -838,14 +989,34 @@ function DashboardPage({ session, onLogout, onNavigate, onOpenDocument }) {
 
     try {
       setUploading(true);
-      setUploadStatus({ type: '', message: '' });
+      setUploadStatus({ type: 'processing', message: 'Uploading PDF and extracting text...' });
       await uploadDocument(selectedFile);
       await refreshDocuments();
       setUploadStatus({ type: 'success', message: 'PDF uploaded successfully.' });
     } catch (error) {
+      await refreshDocuments().catch(() => {});
       setUploadStatus({ type: 'error', message: error.message || 'Upload failed.' });
     } finally {
       setUploading(false);
+    }
+  }
+
+  async function handleDeleteDocument(document) {
+    if (deletingDocumentId || !window.confirm(`Delete ${document.pdf_name}? This permanently deletes the PDF, parsed data, and chat history.`)) {
+      return;
+    }
+
+    try {
+      setDeletingDocumentId(document.id);
+      setDocumentNotice('');
+      await deleteDocument(document.id);
+      setDocuments((current) => current.filter((item) => item.id !== document.id));
+      setOpenDocumentMenuId(null);
+      setDocumentNotice('Document deleted successfully.');
+    } catch {
+      setDocumentNotice('Unable to delete document. Please try again.');
+    } finally {
+      setDeletingDocumentId(null);
     }
   }
 
@@ -965,6 +1136,17 @@ function DashboardPage({ session, onLogout, onNavigate, onOpenDocument }) {
 
               <p className="upload-help">Upload a PDF to parse it and add it to your private document list.</p>
 
+              {uploadStatus.type === 'processing' && (
+                <div className="upload-processing" role="status">
+                  <strong>Processing document</strong>
+                  <span>Uploading PDF, extracting text, and identifying legal sections...</span>
+                  <div className="processing-steps">
+                    <span className="active">Processing</span>
+                    <span>Ready after parsing</span>
+                  </div>
+                </div>
+              )}
+
               {uploadStatus.type === 'success' && (
                 <div className="upload-feedback upload-feedback-success" role="status">
                   <span className="upload-feedback-icon">✓</span>
@@ -994,6 +1176,7 @@ function DashboardPage({ session, onLogout, onNavigate, onOpenDocument }) {
           )}
 
           {loading && <div className="empty-state">Loading your documents...</div>}
+          {documentNotice && <div className="upload-status success">{documentNotice}</div>}
           {error && <div className="form-alert">{error}</div>}
           {!loading && !error && documents.length === 0 && (
             <div className="empty-state">
@@ -1005,18 +1188,68 @@ function DashboardPage({ session, onLogout, onNavigate, onOpenDocument }) {
           {!loading && !error && documents.length > 0 && (
             <div className="document-grid">
               {documents.map((document) => (
-                <button
-                  type="button"
-                  className="document-card"
+                <article
+                  className={`document-card ${document.status === 'completed' ? 'is-openable' : ''}`}
                   key={document.unique_identifier_name}
-                  onClick={() => onOpenDocument(document)}
+                  onClick={() => {
+                    if (openDocumentMenuId === document.id) {
+                      setOpenDocumentMenuId(null);
+                    } else if (document.status === 'completed') {
+                      onOpenDocument(document);
+                    }
+                  }}
+                  onKeyDown={(event) => {
+                    if ((event.key === 'Enter' || event.key === ' ') && document.status === 'completed') {
+                      event.preventDefault();
+                      onOpenDocument(document);
+                    }
+                  }}
+                  role={document.status === 'completed' ? 'button' : undefined}
+                  tabIndex={document.status === 'completed' ? 0 : undefined}
                 >
                   <div className="document-icon">PDF</div>
                   <div>
                     <h3>{document.pdf_name}</h3>
-                    <p>Stored securely in your account.</p>
+                    <p>
+                      {document.status === 'completed'
+                        ? 'Ready for secure review.'
+                        : document.status === 'failed'
+                          ? 'Processing failed. Upload the file again to retry.'
+                          : `Processing: ${document.stage.replaceAll('_', ' ')}`}
+                    </p>
+                    <div className="document-card-menu-wrap">
+                      <button
+                        type="button"
+                        className="document-menu-button"
+                        aria-label={`More actions for ${document.pdf_name}`}
+                        aria-expanded={openDocumentMenuId === document.id}
+                        title="More actions"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          setOpenDocumentMenuId((current) => current === document.id ? null : document.id);
+                        }}
+                      >
+                        <span aria-hidden="true">•••</span>
+                      </button>
+                      {openDocumentMenuId === document.id && (
+                        <div className="document-card-menu" role="menu">
+                          <button
+                            type="button"
+                            className="document-menu-delete"
+                            role="menuitem"
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              handleDeleteDocument(document);
+                            }}
+                            disabled={deletingDocumentId === document.id}
+                          >
+                            {deletingDocumentId === document.id ? 'Deleting...' : 'Delete document'}
+                          </button>
+                        </div>
+                      )}
+                    </div>
                   </div>
-                </button>
+                </article>
               ))}
             </div>
           )}
