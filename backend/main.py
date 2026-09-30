@@ -17,10 +17,19 @@ from general_logic.auth import (
 )
 from general_logic.documents import (
 	build_document_filenames,
+	delete_document_for_user,
 	get_document_for_user,
 	initialize_document_storage,
 	list_documents_for_user,
 	store_document,
+	update_document_status,
+)
+from general_logic.chat_history import (
+	delete_chat_record,
+	initialize_chat_history_storage,
+	list_chat_history,
+	save_chat_history,
+	update_simplified_answer,
 )
 from parser import parse_document_to_json
 from general_logic.retrieval import load_document_json, retrieve_sections
@@ -89,6 +98,7 @@ def _fallback_suggested_questions(document_data: dict[str, object]) -> list[str]
 def startup() -> None:
 	initialize_database()
 	initialize_document_storage()
+	initialize_chat_history_storage()
 
 
 @app.get("/")
@@ -141,6 +151,7 @@ def parse_document(
 	unique_identifier_name, pdf_filename, json_filename = build_document_filenames(original_filename)
 	pdf_storage_path = Path("pdf_storage") / pdf_filename
 	json_storage_path = Path("json_storage") / json_filename
+	stored_document = None
 	try:
 		pdf_storage_path.parent.mkdir(parents=True, exist_ok=True)
 		json_storage_path.parent.mkdir(parents=True, exist_ok=True)
@@ -149,8 +160,7 @@ def parse_document(
 		with open(pdf_storage_path, "wb") as handle:
 			handle.write(pdf_bytes)
 
-		parse_document_to_json(pdf_storage_path, json_storage_path)
-		store_document(
+		stored_document = store_document(
 			user_id=user_id,
 			pdf_name=original_filename,
 			unique_identifier_name=unique_identifier_name,
@@ -158,17 +168,30 @@ def parse_document(
 			document_key=unique_identifier_name,
 			pdf_filename=pdf_filename,
 			json_filename=json_filename,
+			status="processing",
+			stage="uploading",
 		)
+		update_document_status(stored_document["id"], user_id, "processing", "extracting_text")
+		parse_document_to_json(pdf_storage_path, json_storage_path)
+		update_document_status(stored_document["id"], user_id, "completed", "completed")
 
 		return {
 			"message": "Document parsed successfully",
+			"document_id": stored_document["id"],
+			"status": "completed",
+			"stage": "completed",
 		}
 	except Exception as exc:  # pragma: no cover - defensive handling
+		if stored_document is not None:
+			update_document_status(stored_document["id"], user_id, "failed", "failed", "Unable to process this document")
 		if pdf_storage_path.exists():
 			pdf_storage_path.unlink()
 		if json_storage_path.exists():
 			json_storage_path.unlink()
-		raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
+		raise HTTPException(
+			status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+			detail="Unable to process this document",
+		) from exc
 
 
 @app.get("/documents")
@@ -180,6 +203,69 @@ def list_user_documents(user_id: int = Depends(get_current_user_id)) -> dict[str
 	}
 
 
+@app.get("/documents/{document_id}/status")
+def document_status(
+	document_id: int,
+	user_id: int = Depends(get_current_user_id),
+) -> dict[str, object]:
+	document = get_document_for_user(document_id, user_id)
+	if document is None:
+		raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+	return {
+		"document_id": document["id"],
+		"status": document["status"],
+		"stage": document["stage"],
+		"error": document["processing_error"],
+	}
+
+
+@app.get("/documents/{document_id}/chat-history")
+def document_chat_history(
+	document_id: int,
+	user_id: int = Depends(get_current_user_id),
+) -> dict[str, object]:
+	document = get_document_for_user(document_id, user_id)
+	if document is None:
+		raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+	return {"document_id": document_id, "messages": list_chat_history(user_id, document_id)}
+
+
+@app.delete("/documents/{document_id}/chat-history/{chat_id}")
+def delete_chat_history_record(
+	document_id: int,
+	chat_id: int,
+	user_id: int = Depends(get_current_user_id),
+) -> dict[str, object]:
+	document = get_document_for_user(document_id, user_id)
+	if document is None:
+		raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+	if not delete_chat_record(user_id, document_id, chat_id):
+		raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Chat not found")
+	return {
+		"success": True,
+		"message": "Chat deleted successfully",
+		"chat_id": chat_id,
+	}
+
+
+@app.delete("/documents/{document_id}")
+def delete_document(
+	document_id: int,
+	user_id: int = Depends(get_current_user_id),
+) -> dict[str, object]:
+	document = get_document_for_user(document_id, user_id)
+	if document is None:
+		raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+	if not delete_document_for_user(document_id, user_id):
+		raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+
+	_SUGGESTION_CACHE.pop((user_id, document["json_filename"]), None)
+	for answer_id, context in list(_ANSWER_CONTEXT_CACHE.items()):
+		if context[0] == user_id and context[1] == document_id:
+			_ANSWER_CONTEXT_CACHE.pop(answer_id, None)
+	return {"success": True, "message": "Document deleted successfully"}
+
+
 @app.get("/documents/{document_id}/suggested-questions")
 def suggested_questions(
 	document_id: int,
@@ -188,6 +274,8 @@ def suggested_questions(
 	document = get_document_for_user(document_id, user_id)
 	if document is None:
 		raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+	if document["status"] != "completed":
+		raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="This document is not ready for questions")
 
 	try:
 		document_data = load_document_json(document["json_filename"])
@@ -246,6 +334,8 @@ def ask_document_question(
 	document = get_document_for_user(document_id, user_id)
 	if document is None:
 		raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found")
+	if document["status"] != "completed":
+		raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="This document is not ready for questions")
 
 	try:
 		document_data = load_document_json(document["json_filename"])
@@ -254,8 +344,12 @@ def ask_document_question(
 		raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
 
 	if not retrieved_sections:
+		answer_id = uuid4().hex
+		history_id = save_chat_history(user_id, document_id, answer_id, question, "I could not find sufficient information about that question in this document.", [])
 		return {
 			"document": {"id": document["id"], "name": document["pdf_name"]},
+			"answer_id": answer_id,
+			"history_id": history_id,
 			"answer": "I could not find sufficient information about that question in this document.",
 			"found_information": False,
 			"sources": [],
@@ -280,10 +374,12 @@ def ask_document_question(
 		for section in retrieved_sections
 	]
 	answer_id = uuid4().hex
+	history_id = save_chat_history(user_id, document_id, answer_id, question, answer, sources)
 	_ANSWER_CONTEXT_CACHE[answer_id] = (user_id, document_id, question, retrieved_sections)
 	return {
 		"document": {"id": document["id"], "name": document["pdf_name"]},
 		"answer_id": answer_id,
+		"history_id": history_id,
 		"answer": answer,
 		"found_information": found_information,
 		"sources": sources,
@@ -314,5 +410,6 @@ def simplify_document_answer(
 	except RuntimeError as exc:
 		raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(exc)) from exc
 
+	update_simplified_answer(user_id, document_id, payload.answer_id, answer)
 	return {"answer": answer, "found_information": found_information}
 
