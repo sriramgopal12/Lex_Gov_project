@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import re
-from collections import Counter
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
+
+import numpy as np
 
 JSON_STORAGE_DIR = Path(__file__).resolve().parent.parent / "json_storage"
 logger = logging.getLogger(__name__)
@@ -17,6 +18,7 @@ MIN_RELEVANCE_SCORE = 0.25
 SEMANTIC_WEIGHT = 0.65
 KEYWORD_WEIGHT = 0.25
 METADATA_WEIGHT = 0.10
+EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 
 _STOP_WORDS = {
     "a",
@@ -42,15 +44,6 @@ _STOP_WORDS = {
     "who",
     "with",
 }
-_SEMANTIC_GROUPS = (
-    {"time", "period", "deadline", "limit", "期限"},
-    {"provide", "providing", "provided", "give", "giving", "response", "respond"},
-    {"request", "application", "applicant", "apply"},
-    {"duty", "duties", "obligation", "obligations", "responsibility"},
-    {"deny", "denied", "rejection", "reject", "refusal"},
-    {"authority", "authorities", "officer", "official"},
-    {"appeal", "appeals", "review", "remedy"},
-)
 
 
 def _tokens(value: str) -> set[str]:
@@ -63,14 +56,6 @@ def _tokens(value: str) -> set[str]:
 
 def _normalize_text(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "").lower()).strip()
-
-
-def _expanded_tokens(tokens: set[str]) -> set[str]:
-    expanded = set(tokens)
-    for group in _SEMANTIC_GROUPS:
-        if tokens & group:
-            expanded.update(group)
-    return expanded
 
 
 def _requested_section_numbers(value: str) -> set[str]:
@@ -94,23 +79,36 @@ def _section_fields(section: dict[str, Any]) -> dict[str, str]:
     }
 
 
-def _cosine_similarity(left: Counter[str], right: Counter[str]) -> float:
-    if not left or not right:
-        return 0.0
-    common = set(left) & set(right)
-    numerator = sum(left[token] * right[token] for token in common)
-    denominator = math.sqrt(sum(value * value for value in left.values())) * math.sqrt(
-        sum(value * value for value in right.values())
-    )
-    return numerator / denominator if denominator else 0.0
+@lru_cache(maxsize=1)
+def _model():
+    # Imported here so the slow model load happens once, on first use.
+    from sentence_transformers import SentenceTransformer
+
+    return SentenceTransformer(EMBEDDING_MODEL, device="cpu")
 
 
-def _semantic_score(question_tokens: set[str], fields: dict[str, str]) -> float:
-    query_vector = Counter(_expanded_tokens(question_tokens))
-    section_vector = Counter(
-        _expanded_tokens(_tokens(" ".join(fields[field] for field in ("title", "heading", "content", "chapter"))))
-    )
-    return min(1.0, _cosine_similarity(query_vector, section_vector) * 1.35)
+def _embed(texts: list[str]) -> np.ndarray:
+    return _model().encode(texts, normalize_embeddings=True, convert_to_numpy=True)
+
+
+def _section_text(section: Any) -> str:
+    if not isinstance(section, dict):
+        return ""
+    # ponytail: the model reads ~256 tokens, so long sections are judged by their start; chunk them if that hurts recall.
+    return f"{section.get('title', section.get('heading', ''))}. {section.get('content', section.get('text', ''))}"
+
+
+def _section_vectors(document_data: dict[str, Any]) -> np.ndarray:
+    vectors = document_data.get("_embeddings")
+    if vectors is None or len(vectors) != len(document_data["sections"]):
+        vectors = _embed([_section_text(section) for section in document_data["sections"]])
+        document_data["_embeddings"] = vectors
+    return vectors
+
+
+def _semantic_score(question_vector: np.ndarray, section_vector: np.ndarray) -> float:
+    # Vectors are normalised, so the dot product is the cosine similarity.
+    return max(0.0, float(np.dot(question_vector, section_vector)))
 
 
 def _keyword_score(
@@ -168,6 +166,15 @@ def load_document_json(json_filename: str) -> dict[str, Any]:
     if not isinstance(data, dict) or not isinstance(data.get("sections"), list):
         raise ValueError("Structured document data has an invalid format")
 
+    # Section embeddings are cached next to the JSON; older documents get theirs built on first use.
+    # ponytail: staleness is detected by row count only; delete the .npy if a JSON is edited in place.
+    cache_path = json_path.with_suffix(".npy")
+    cached = np.load(cache_path) if cache_path.is_file() else None
+    if cached is not None and len(cached) == len(data["sections"]):
+        data["_embeddings"] = cached
+    else:
+        np.save(cache_path, _section_vectors(data))
+
     return data
 
 
@@ -186,15 +193,17 @@ def retrieve_sections(
     if not question_tokens and not requested_section_numbers:
         return []
 
+    question_vector = _embed([question])[0]
+    section_vectors = _section_vectors(document_data)
     candidates: list[dict[str, Any]] = []
-    for section in document_data.get("sections", []):
+    for index, section in enumerate(document_data["sections"]):
         if not isinstance(section, dict):
             continue
 
         fields = _section_fields(section)
         if not any(fields[field] for field in ("section_number", "title", "heading", "content")):
             continue
-        semantic_score = _semantic_score(question_tokens, fields)
+        semantic_score = _semantic_score(question_vector, section_vectors[index])
         keyword_score = _keyword_score(question, question_tokens, requested_section_numbers, fields)
         metadata_score = _metadata_score(question_tokens, requested_section_numbers, fields)
         candidates.append(

@@ -299,6 +299,7 @@ def delete_document_for_user(document_id: int, user_id: int) -> bool:
 	for storage_dir, filename in (
 		("pdf_storage", document["pdf_filename"]),
 		("json_storage", document["json_filename"]),
+		("json_storage", str(Path(document["json_filename"]).with_suffix(".npy"))),
 	):
 		path = _document_storage_path(storage_dir, filename)
 		try:

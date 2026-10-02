@@ -134,3 +134,30 @@ def test_retrieve_sections_ignores_malformed_sections_and_sorts_scores() -> None
 
      assert results
      assert all(results[index]["final_score"] >= results[index + 1]["final_score"] for index in range(len(results) - 1))
+
+
+def test_retrieve_sections_matches_paraphrased_question() -> None:
+     document = {
+         "sections": [
+             {
+                 "section_number": "6",
+                 "title": "Request for obtaining information",
+                 "content": "A person who desires to obtain information shall make a request in writing.",
+             },
+             {
+                 "section_number": "8",
+                 "title": "Exemption from disclosure",
+                 "content": "There shall be no obligation to furnish any citizen with records that would prejudicially affect the sovereignty and integrity of India.",
+             },
+             {
+                 "section_number": "20",
+                 "title": "Penalties",
+                 "content": "The Commission shall impose a penalty of two hundred and fifty rupees each day.",
+             },
+         ]
+     }
+
+     results = retrieve_sections(document, "Can the government refuse to give me information?")
+
+     # Section 8 shares no words with the question, so only meaning-based scoring can find it.
+     assert "8" in [result["section_number"] for result in results]

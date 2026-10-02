@@ -5,3 +5,7 @@ bcrypt<5
 pydantic
 email-validator
 PyJWT
+python-multipart
+pymupdf
+sentence-transformers
+numpy

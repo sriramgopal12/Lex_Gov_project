@@ -173,6 +173,7 @@ def parse_document(
 		)
 		update_document_status(stored_document["id"], user_id, "processing", "extracting_text")
 		parse_document_to_json(pdf_storage_path, json_storage_path)
+		load_document_json(json_filename)  # builds the section embedding cache (.npy)
 		update_document_status(stored_document["id"], user_id, "completed", "completed")
 
 		return {
@@ -188,6 +189,7 @@ def parse_document(
 			pdf_storage_path.unlink()
 		if json_storage_path.exists():
 			json_storage_path.unlink()
+		json_storage_path.with_suffix(".npy").unlink(missing_ok=True)
 		raise HTTPException(
 			status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
 			detail="Unable to process this document",
